@@ -427,7 +427,7 @@ class HTTPAdapter(BaseAdapter):
         proxy_url = parse_url(proxy)
         if not proxy_url.host:
             raise InvalidProxyURL(
-                "Please check proxy URL. It is malformed and may be missing the host."
+                "Please check proxy URL. It is malformed and could be missing the host."
             )
         return self.proxy_manager_for(proxy)
 
