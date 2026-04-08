@@ -421,6 +421,48 @@ class HTTPAdapter(BaseAdapter):
         """
         return _urllib3_request_context(request, verify, cert, self.poolmanager)
 
+    # Refactoring type: Consolidate Duplicate Code (Extract Common Method) - shared proxy URL normalization and validation.
+    def _proxy_manager_from_proxy_url(self, proxy):
+        proxy = prepend_scheme_if_needed(proxy, "http")
+        proxy_url = parse_url(proxy)
+        if not proxy_url.host:
+            raise InvalidProxyURL(
+                "Please check proxy URL. It is malformed and could be missing the host."
+            )
+        return self.proxy_manager_for(proxy)
+
+    # Refactoring type: Extract Method + Replace Conditional with helper dispatch - isolate MaxRetryError translation logic.
+    @staticmethod
+    def _raise_max_retry_error(error, request):
+        if isinstance(error.reason, ConnectTimeoutError):
+            # TODO: Remove this in 3.0.0: see #2811
+            if not isinstance(error.reason, NewConnectionError):
+                raise ConnectTimeout(error, request=request)
+
+        if isinstance(error.reason, ResponseError):
+            raise RetryError(error, request=request)
+
+        if isinstance(error.reason, _ProxyError):
+            raise ProxyError(error, request=request)
+
+        if isinstance(error.reason, _SSLError):
+            # This branch is for urllib3 v1.22 and later.
+            raise SSLError(error, request=request)
+
+        raise ConnectionError(error, request=request)
+
+    # Refactoring type: Extract Method + Replace Conditional with helper dispatch - isolate urllib3 HTTP error translation logic.
+    @staticmethod
+    def _raise_http_error(error, request):
+        if isinstance(error, _SSLError):
+            # This branch is for urllib3 versions earlier than v1.22
+            raise SSLError(error, request=request)
+        if isinstance(error, ReadTimeoutError):
+            raise ReadTimeout(error, request=request)
+        if isinstance(error, _InvalidHeader):
+            raise InvalidHeader(error, request=request)
+        raise error
+
     def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
         """Returns a urllib3 connection for the given request and TLS settings.
         This should not be called from user code, and is only exposed for use
@@ -451,14 +493,7 @@ class HTTPAdapter(BaseAdapter):
         except ValueError as e:
             raise InvalidURL(e, request=request)
         if proxy:
-            proxy = prepend_scheme_if_needed(proxy, "http")
-            proxy_url = parse_url(proxy)
-            if not proxy_url.host:
-                raise InvalidProxyURL(
-                    "Please check proxy URL. It is malformed "
-                    "and could be missing the host."
-                )
-            proxy_manager = self.proxy_manager_for(proxy)
+            proxy_manager = self._proxy_manager_from_proxy_url(proxy)
             conn = proxy_manager.connection_from_host(
                 **host_params, pool_kwargs=pool_kwargs
             )
@@ -494,14 +529,7 @@ class HTTPAdapter(BaseAdapter):
         proxy = select_proxy(url, proxies)
 
         if proxy:
-            proxy = prepend_scheme_if_needed(proxy, "http")
-            proxy_url = parse_url(proxy)
-            if not proxy_url.host:
-                raise InvalidProxyURL(
-                    "Please check proxy URL. It is malformed "
-                    "and could be missing the host."
-                )
-            proxy_manager = self.proxy_manager_for(proxy)
+            proxy_manager = self._proxy_manager_from_proxy_url(proxy)
             conn = proxy_manager.connection_from_url(url)
         else:
             # Only scheme should be lower case
@@ -660,22 +688,7 @@ class HTTPAdapter(BaseAdapter):
             raise ConnectionError(err, request=request)
 
         except MaxRetryError as e:
-            if isinstance(e.reason, ConnectTimeoutError):
-                # TODO: Remove this in 3.0.0: see #2811
-                if not isinstance(e.reason, NewConnectionError):
-                    raise ConnectTimeout(e, request=request)
-
-            if isinstance(e.reason, ResponseError):
-                raise RetryError(e, request=request)
-
-            if isinstance(e.reason, _ProxyError):
-                raise ProxyError(e, request=request)
-
-            if isinstance(e.reason, _SSLError):
-                # This branch is for urllib3 v1.22 and later.
-                raise SSLError(e, request=request)
-
-            raise ConnectionError(e, request=request)
+            self._raise_max_retry_error(e, request)
 
         except ClosedPoolError as e:
             raise ConnectionError(e, request=request)
@@ -684,14 +697,6 @@ class HTTPAdapter(BaseAdapter):
             raise ProxyError(e)
 
         except (_SSLError, _HTTPError) as e:
-            if isinstance(e, _SSLError):
-                # This branch is for urllib3 versions earlier than v1.22
-                raise SSLError(e, request=request)
-            elif isinstance(e, ReadTimeoutError):
-                raise ReadTimeout(e, request=request)
-            elif isinstance(e, _InvalidHeader):
-                raise InvalidHeader(e, request=request)
-            else:
-                raise
+            self._raise_http_error(e, request)
 
         return self.build_response(request, resp)
