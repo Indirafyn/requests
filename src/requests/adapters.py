@@ -461,7 +461,7 @@ class HTTPAdapter(BaseAdapter):
             raise ReadTimeout(error, request=request)
         if isinstance(error, _InvalidHeader):
             raise InvalidHeader(error, request=request)
-        raise error
+        raise
 
     def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
         """Returns a urllib3 connection for the given request and TLS settings.

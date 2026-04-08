@@ -589,7 +589,9 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 self._body_position = object()
 
         if files:
-            raise NotImplementedError("Streamed bodies and files are mutually exclusive.")
+            raise NotImplementedError(
+                "Streamed bodies and files are mutually exclusive."
+            )
 
         if length:
             self.headers["Content-Length"] = builtin_str(length)
