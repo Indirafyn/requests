@@ -105,6 +105,81 @@ def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
 
 
 class SessionRedirectMixin:
+    # Refactoring type: Extract Method - split redirect response draining from the redirect loop.
+    @staticmethod
+    def _consume_response_content(resp):
+        try:
+            resp.content  # Consume socket so it can be released
+        except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
+            resp.raw.read(decode_content=False)
+
+    # Refactoring type: Extract Method - isolate URL normalization and fragment handling.
+    def _normalize_redirect_url(self, url, response_url, previous_fragment):
+        # Handle redirection without scheme (see: RFC 1808 Section 4)
+        if url.startswith("//"):
+            parsed_rurl = urlparse(response_url)
+            url = ":".join([to_native_string(parsed_rurl.scheme), url])
+
+        # Normalize url case and attach previous fragment if needed (RFC 7231 7.1.2)
+        parsed = urlparse(url)
+        if parsed.fragment == "" and previous_fragment:
+            parsed = parsed._replace(fragment=previous_fragment)
+        elif parsed.fragment:
+            previous_fragment = parsed.fragment
+        normalized = parsed.geturl()
+
+        # Facilitate relative 'location' headers, as allowed by RFC 7231.
+        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+        # Compliant with RFC3986, we percent encode the url.
+        if not parsed.netloc:
+            normalized = urljoin(response_url, requote_uri(normalized))
+        else:
+            normalized = requote_uri(normalized)
+
+        return normalized, previous_fragment
+
+    # Refactoring type: Extract Method - centralize request mutation for each redirect hop.
+    def _prepare_redirect_request(self, prepared_request, previous_request, response, proxies):
+        self.rebuild_method(prepared_request, response)
+
+        # https://github.com/psf/requests/issues/1084
+        if response.status_code not in (
+            codes.temporary_redirect,
+            codes.permanent_redirect,
+        ):
+            # https://github.com/psf/requests/issues/3490
+            purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
+            for header in purged_headers:
+                prepared_request.headers.pop(header, None)
+            prepared_request.body = None
+
+        headers = prepared_request.headers
+        headers.pop("Cookie", None)
+
+        # Extract any cookies sent on the response to the cookiejar
+        # in the new request. Because we've mutated our copied prepared
+        # request, use the old one that we haven't yet touched.
+        extract_cookies_to_jar(prepared_request._cookies, previous_request, response.raw)
+        merge_cookies(prepared_request._cookies, self.cookies)
+        prepared_request.prepare_cookies(prepared_request._cookies)
+
+        # Rebuild auth and proxy information.
+        proxies = self.rebuild_proxies(prepared_request, proxies)
+        self.rebuild_auth(prepared_request, response)
+
+        # A failed tell() sets `_body_position` to `object()`. This non-None
+        # value ensures `rewindable` will be True, allowing us to raise an
+        # UnrewindableBodyError, instead of hanging the connection.
+        rewindable = prepared_request._body_position is not None and (
+            "Content-Length" in headers or "Transfer-Encoding" in headers
+        )
+
+        # Attempt to rewind consumed file-like object.
+        if rewindable:
+            rewind_body(prepared_request)
+
+        return proxies
+
     def get_redirect_target(self, resp):
         """Receives a Response. Returns a redirect URI or ``None``"""
         # Due to the nature of how requests processes redirects this method will
@@ -182,10 +257,7 @@ class SessionRedirectMixin:
             resp.history = hist[:]
             hist.append(resp)
 
-            try:
-                resp.content  # Consume socket so it can be released
-            except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
-                resp.raw.read(decode_content=False)
+            self._consume_response_content(resp)
 
             if len(resp.history) >= self.max_redirects:
                 raise TooManyRedirects(
@@ -195,66 +267,12 @@ class SessionRedirectMixin:
             # Release the connection back into the pool.
             resp.close()
 
-            # Handle redirection without scheme (see: RFC 1808 Section 4)
-            if url.startswith("//"):
-                parsed_rurl = urlparse(resp.url)
-                url = ":".join([to_native_string(parsed_rurl.scheme), url])
-
-            # Normalize url case and attach previous fragment if needed (RFC 7231 7.1.2)
-            parsed = urlparse(url)
-            if parsed.fragment == "" and previous_fragment:
-                parsed = parsed._replace(fragment=previous_fragment)
-            elif parsed.fragment:
-                previous_fragment = parsed.fragment
-            url = parsed.geturl()
-
-            # Facilitate relative 'location' headers, as allowed by RFC 7231.
-            # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
-            # Compliant with RFC3986, we percent encode the url.
-            if not parsed.netloc:
-                url = urljoin(resp.url, requote_uri(url))
-            else:
-                url = requote_uri(url)
-
-            prepared_request.url = to_native_string(url)
-
-            self.rebuild_method(prepared_request, resp)
-
-            # https://github.com/psf/requests/issues/1084
-            if resp.status_code not in (
-                codes.temporary_redirect,
-                codes.permanent_redirect,
-            ):
-                # https://github.com/psf/requests/issues/3490
-                purged_headers = ("Content-Length", "Content-Type", "Transfer-Encoding")
-                for header in purged_headers:
-                    prepared_request.headers.pop(header, None)
-                prepared_request.body = None
-
-            headers = prepared_request.headers
-            headers.pop("Cookie", None)
-
-            # Extract any cookies sent on the response to the cookiejar
-            # in the new request. Because we've mutated our copied prepared
-            # request, use the old one that we haven't yet touched.
-            extract_cookies_to_jar(prepared_request._cookies, req, resp.raw)
-            merge_cookies(prepared_request._cookies, self.cookies)
-            prepared_request.prepare_cookies(prepared_request._cookies)
-
-            # Rebuild auth and proxy information.
-            proxies = self.rebuild_proxies(prepared_request, proxies)
-            self.rebuild_auth(prepared_request, resp)
-
-            # A failed tell() sets `_body_position` to `object()`. This non-None
-            # value ensures `rewindable` will be True, allowing us to raise an
-            # UnrewindableBodyError, instead of hanging the connection.
-            rewindable = prepared_request._body_position is not None and (
-                "Content-Length" in headers or "Transfer-Encoding" in headers
+            url, previous_fragment = self._normalize_redirect_url(
+                url, resp.url, previous_fragment
             )
 
-            # Attempt to rewind consumed file-like object.
-            if rewindable:
-                rewind_body(prepared_request)
+            prepared_request.url = to_native_string(url)
+            proxies = self._prepare_redirect_request(prepared_request, req, resp, proxies)
 
             # Override the original request.
             req = prepared_request
@@ -561,19 +579,20 @@ class Session(SessionRedirectMixin):
             If Tuple, ('cert', 'key') pair.
         :rtype: requests.Response
         """
-        # Create the Request.
-        req = Request(
-            method=method.upper(),
-            url=url,
-            headers=headers,
-            files=files,
-            data=data or {},
-            json=json,
-            params=params or {},
-            auth=auth,
-            cookies=cookies,
-            hooks=hooks,
-        )
+        # Refactoring type: Introduce Parameter Object - group request constructor data.
+        request_kwargs = {
+            "method": method.upper(),
+            "url": url,
+            "headers": headers,
+            "files": files,
+            "data": data or {},
+            "json": json,
+            "params": params or {},
+            "auth": auth,
+            "cookies": cookies,
+            "hooks": hooks,
+        }
+        req = Request(**request_kwargs)
         prep = self.prepare_request(req)
 
         proxies = proxies or {}

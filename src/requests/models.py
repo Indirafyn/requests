@@ -408,6 +408,47 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
             raise UnicodeError
         return host
 
+    # Refactoring type: Decompose Conditional - separate URL coercion from URL preparation.
+    @staticmethod
+    def _coerce_url_value(url):
+        if isinstance(url, bytes):
+            return url.decode("utf8")
+        return str(url)
+
+    # Refactoring type: Decompose Conditional - isolate host validation and IDNA normalization.
+    def _normalize_host_for_url(self, host):
+        if not unicode_is_ascii(host):
+            try:
+                return self._get_idna_encoded_host(host)
+            except UnicodeError:
+                raise InvalidURL("URL has an invalid label.")
+        if host.startswith(("*", ".")):
+            raise InvalidURL("URL has an invalid label.")
+        return host
+
+    # Refactoring type: Decompose Conditional - isolate netloc reconstruction logic.
+    @staticmethod
+    def _rebuild_netloc(auth, host, port):
+        netloc = auth or ""
+        if netloc:
+            netloc += "@"
+        netloc += host
+        if port:
+            netloc += f":{port}"
+        return netloc
+
+    # Refactoring type: Decompose Conditional - isolate query merge logic.
+    def _merge_url_query(self, query, params):
+        if isinstance(params, (str, bytes)):
+            params = to_native_string(params)
+
+        enc_params = self._encode_params(params)
+        if not enc_params:
+            return query
+        if query:
+            return f"{query}&{enc_params}"
+        return enc_params
+
     def prepare_url(self, url, params):
         """Prepares the given HTTP URL."""
         #: Accept objects that have string representations.
@@ -415,10 +456,7 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         #: as this will include the bytestring indicator (b'')
         #: on python 3.x.
         #: https://github.com/psf/requests/pull/2238
-        if isinstance(url, bytes):
-            url = url.decode("utf8")
-        else:
-            url = str(url)
+        url = self._coerce_url_value(url)
 
         # Remove leading whitespaces from url
         url = url.lstrip()
@@ -449,35 +487,16 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         # non-ASCII characters. This allows users to automatically get the correct IDNA
         # behaviour. For strings containing only ASCII characters, we need to also verify
         # it doesn't start with a wildcard (*), before allowing the unencoded hostname.
-        if not unicode_is_ascii(host):
-            try:
-                host = self._get_idna_encoded_host(host)
-            except UnicodeError:
-                raise InvalidURL("URL has an invalid label.")
-        elif host.startswith(("*", ".")):
-            raise InvalidURL("URL has an invalid label.")
+        host = self._normalize_host_for_url(host)
 
         # Carefully reconstruct the network location
-        netloc = auth or ""
-        if netloc:
-            netloc += "@"
-        netloc += host
-        if port:
-            netloc += f":{port}"
+        netloc = self._rebuild_netloc(auth, host, port)
 
         # Bare domains aren't valid URLs.
         if not path:
             path = "/"
 
-        if isinstance(params, (str, bytes)):
-            params = to_native_string(params)
-
-        enc_params = self._encode_params(params)
-        if enc_params:
-            if query:
-                query = f"{query}&{enc_params}"
-            else:
-                query = enc_params
+        query = self._merge_url_query(query, params)
 
         url = requote_uri(urlunparse([scheme, netloc, path, None, query, fragment]))
         self.url = url
@@ -503,66 +522,17 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         body = None
         content_type = None
 
-        if not data and json is not None:
-            # urllib3 requires a bytes-like body. Python 2's json.dumps
-            # provides this natively, but Python 3 gives a Unicode string.
-            content_type = "application/json"
+        # Refactoring type: Extract Method - split JSON body preparation from stream/form handling.
+        body, content_type = self._prepare_json_body(data, json)
 
-            try:
-                body = complexjson.dumps(json, allow_nan=False)
-            except ValueError as ve:
-                raise InvalidJSONError(ve, request=self)
-
-            if not isinstance(body, bytes):
-                body = body.encode("utf-8")
-
-        is_stream = all(
-            [
-                hasattr(data, "__iter__"),
-                not isinstance(data, (basestring, list, tuple, Mapping)),
-            ]
-        )
+        is_stream = self._is_stream_body(data)
 
         if is_stream:
-            try:
-                length = super_len(data)
-            except (TypeError, AttributeError, UnsupportedOperation):
-                length = None
-
-            body = data
-
-            if getattr(body, "tell", None) is not None:
-                # Record the current file position before reading.
-                # This will allow us to rewind a file in the event
-                # of a redirect.
-                try:
-                    self._body_position = body.tell()
-                except OSError:
-                    # This differentiates from None, allowing us to catch
-                    # a failed `tell()` later when trying to rewind the body
-                    self._body_position = object()
-
-            if files:
-                raise NotImplementedError(
-                    "Streamed bodies and files are mutually exclusive."
-                )
-
-            if length:
-                self.headers["Content-Length"] = builtin_str(length)
-            else:
-                self.headers["Transfer-Encoding"] = "chunked"
+            body = self._prepare_stream_body(data, files)
         else:
-            # Multi-part file uploads.
-            if files:
-                (body, content_type) = self._encode_files(files, data)
-            else:
-                if data:
-                    body = self._encode_params(data)
-                    if isinstance(data, basestring) or hasattr(data, "read"):
-                        content_type = None
-                    else:
-                        content_type = "application/x-www-form-urlencoded"
-
+            body, content_type = self._prepare_non_stream_body(
+                data, files, body, content_type
+            )
             self.prepare_content_length(body)
 
             # Add content-type if it wasn't explicitly provided.
@@ -570,6 +540,80 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 self.headers["Content-Type"] = content_type
 
         self.body = body
+
+    # Refactoring type: Extract Method - isolate JSON serialization behavior used by prepare_body.
+    def _prepare_json_body(self, data, json):
+        if data or json is None:
+            return None, None
+
+        # urllib3 requires a bytes-like body. Python 2's json.dumps
+        # provides this natively, but Python 3 gives a Unicode string.
+        content_type = "application/json"
+        try:
+            body = complexjson.dumps(json, allow_nan=False)
+        except ValueError as ve:
+            raise InvalidJSONError(ve, request=self)
+
+        if not isinstance(body, bytes):
+            body = body.encode("utf-8")
+
+        return body, content_type
+
+    # Refactoring type: Extract Method - isolate stream detection logic used by prepare_body.
+    @staticmethod
+    def _is_stream_body(data):
+        return all(
+            [
+                hasattr(data, "__iter__"),
+                not isinstance(data, (basestring, list, tuple, Mapping)),
+            ]
+        )
+
+    # Refactoring type: Extract Method - isolate stream body handling and rewind bookkeeping.
+    def _prepare_stream_body(self, data, files):
+        try:
+            length = super_len(data)
+        except (TypeError, AttributeError, UnsupportedOperation):
+            length = None
+
+        body = data
+        if getattr(body, "tell", None) is not None:
+            # Record the current file position before reading.
+            # This will allow us to rewind a file in the event
+            # of a redirect.
+            try:
+                self._body_position = body.tell()
+            except OSError:
+                # This differentiates from None, allowing us to catch
+                # a failed `tell()` later when trying to rewind the body
+                self._body_position = object()
+
+        if files:
+            raise NotImplementedError(
+                "Streamed bodies and files are mutually exclusive."
+            )
+
+        if length:
+            self.headers["Content-Length"] = builtin_str(length)
+        else:
+            self.headers["Transfer-Encoding"] = "chunked"
+
+        return body
+
+    # Refactoring type: Extract Method - isolate multipart/form body preparation.
+    def _prepare_non_stream_body(self, data, files, body, content_type):
+        # Multi-part file uploads.
+        if files:
+            return self._encode_files(files, data)
+
+        if data:
+            body = self._encode_params(data)
+            if isinstance(data, basestring) or hasattr(data, "read"):
+                content_type = None
+            else:
+                content_type = "application/x-www-form-urlencoded"
+
+        return body, content_type
 
     def prepare_content_length(self, body):
         """Prepare Content-Length header based on request method and body"""
